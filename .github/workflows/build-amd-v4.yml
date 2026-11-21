@@ -1,0 +1,181 @@
+name: Experimental Duskbloods v4 AMD Windows build
+on:
+  push:
+    branches:
+      - amd-v4-binary-build-20261121
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  windows-amd:
+    runs-on: windows-2022
+    timeout-minutes: 120
+    steps:
+      - name: Check out the original v4 source
+        uses: actions/checkout@v4
+        with:
+          repository: Mr-Tb/lichii-dusk
+          ref: duskbloods-v4
+          path: upstream
+          persist-credentials: false
+
+      - name: Apply experimental AMD compute-binding source patch
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          root = Path("upstream")
+
+          def replace(path, before, after):
+              f = root / path
+              text = f.read_text(encoding="utf-8")
+              n = text.count(before)
+              if n != 1:
+                  raise RuntimeError(f"{path}: expected one source match; got {n}")
+              f.write_text(text.replace(before, after, 1), encoding="utf-8")
+
+          replace("src/video_core/renderer_vulkan/vk_buffer_cache.h",
+                  """    u64 GetMaxStorageBufferRange() const;""",
+                  """    u64 GetMaxStorageBufferRange() const;
+
+              // Experimental Duskbloods native compute binding policy.
+              [[nodiscard]] bool IsAmdVulkan() const;""")
+
+          replace("src/video_core/renderer_vulkan/vk_buffer_cache.cpp",
+                  """u64 BufferCacheRuntime::GetMaxStorageBufferRange() const {
+              return device.GetMaxStorageBufferRange();
+          }""",
+                  """u64 BufferCacheRuntime::GetMaxStorageBufferRange() const {
+              return device.GetMaxStorageBufferRange();
+          }
+
+          bool BufferCacheRuntime::IsAmdVulkan() const {
+              const VkDriverIdKHR id = device.GetDriverID();
+              return id == VK_DRIVER_ID_AMD_PROPRIETARY || id == VK_DRIVER_ID_AMD_OPEN_SOURCE ||
+                     id == VK_DRIVER_ID_MESA_RADV;
+          }""")
+
+          replace("src/video_core/renderer_opengl/gl_buffer_cache.h",
+                  """    u64 GetMaxStorageBufferRange() const {
+                  return device.GetMaxShaderStorageBlockSize();
+              }""",
+                  """    u64 GetMaxStorageBufferRange() const {
+                  return device.GetMaxShaderStorageBlockSize();
+              }
+
+              [[nodiscard]] bool IsAmdVulkan() const {
+                  return false;
+              }""")
+
+          replace("src/video_core/buffer_cache/buffer_cache.h",
+                  """                // EDEN_NX2_DUSK_SSBO_SIZE=v25: The Duskbloods keeps dusk-v2.5's 8 MiB cap (A/B for
+                          // its fog compute, which reads ~100 MiB bindings since #1231).
+                          static const bool dusk_v25_size = [] {
+                              const char* value = std::getenv("EDEN_NX2_DUSK_SSBO_SIZE");
+                              return Settings::GetCurrentProgramID() == 0x0400D1D02399A000ULL &&
+                                     value != nullptr && std::string_view{value} == "v25";
+                          }();
+                          if (compute && !is_written && next_qword_is_size && packed_size > bare &&
+                              !dusk_v25_size) {
+                              return (std::min)(packed_size, limit);
+                          }
+                          return bare;""",
+                  """                // Experimental AMD Vulkan cap, only for Duskbloods native read-only compute.
+                          // Does not prove the fixed-address device fault is solved.
+                          const bool dusk = Settings::GetCurrentProgramID() == 0x0400D1D02399A000ULL;
+                          const char* value = std::getenv("EDEN_NX2_DUSK_SSBO_SIZE");
+                          const std::string_view mode = value ? std::string_view{value} : std::string_view{};
+                          const bool dusk_v25_size = dusk && mode == "v25";
+                          if (compute && !is_written && next_qword_is_size && packed_size > bare &&
+                              !dusk_v25_size) {
+                              u32 bound = (std::min)(packed_size, limit);
+                              if (dusk && runtime.IsAmdVulkan() && mode != "read") {
+                                  constexpr u32 amd_dusk_cap = static_cast<u32>(128_MiB);
+                                  if (bound > amd_dusk_cap) {
+                                      static std::atomic_flag logged = ATOMIC_FLAG_INIT;
+                                      if (!logged.test_and_set(std::memory_order_relaxed)) {
+                                          LOG_WARNING(HW_GPU,
+                                                      "Duskbloods AMD Vulkan: clamping read-only native "
+                                                      "compute storage binding from {:#x} to {:#x} bytes",
+                                                      bound, amd_dusk_cap);
+                                      }
+                                      bound = amd_dusk_cap;
+                                  }
+                              }
+                              return bound;
+                          }
+                          return bare;""")
+          PY
+          git -C upstream diff --check
+          git -C upstream diff --stat
+
+      - name: Set up MSVC
+        uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Install LLVM
+        shell: pwsh
+        working-directory: upstream
+        run: ./tools/windows/install-llvm.ps1
+
+      - name: Install Qt
+        uses: jurplel/install-qt-action@v4
+        with:
+          version: "6.8.3"
+          host: windows
+          target: desktop
+          arch: win64_msvc2022_64
+          modules: qtcharts qtimageformats
+          cache: true
+
+      - name: Install Vulkan SDK
+        shell: pwsh
+        working-directory: upstream
+        run: ./tools/windows/install-vulkan-sdk.ps1
+
+      - name: Configure Windows release
+        shell: bash
+        working-directory: upstream
+        run: |
+          cmake -S . -B build/release -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DBUILD_TESTING=OFF \
+            -DLICHII_TESTS=OFF \
+            -DLICHII_CMD=OFF \
+            -DLICHII_ROOM=OFF \
+            -DLICHII_ROOM_STANDALONE=OFF \
+            -DLICHII_USE_BUNDLED_QT=OFF \
+            -DENABLE_QT_TRANSLATION=ON \
+            -DLICHII_USE_BUNDLED_SDL3=ON \
+            -DENABLE_UPDATE_CHECKER=OFF \
+            -DUSE_DISCORD_PRESENCE=OFF \
+            "-DCMAKE_C_COMPILER=$LLVM_ROOT/bin/clang-cl.exe" \
+            "-DCMAKE_CXX_COMPILER=$LLVM_ROOT/bin/clang-cl.exe" \
+            "-DCMAKE_LINKER=$LLVM_ROOT/bin/lld-link.exe" \
+            "-DCMAKE_AR=$LLVM_ROOT/bin/llvm-lib.exe" \
+            "-DCMAKE_C_FLAGS=-DWIN32 -D_WINDOWS -DNOMINMAX" \
+            "-DCMAKE_CXX_FLAGS=-EHsc -DWIN32 -D_WINDOWS -DNOMINMAX"
+
+      - name: Compile Windows lichii.exe
+        shell: bash
+        working-directory: upstream
+        run: cmake --build build/release --target lichii --parallel 3
+
+      - name: Collect executable and Qt DLL dependencies
+        shell: pwsh
+        working-directory: upstream
+        run: |
+          if (-not (Test-Path "build/release/bin/lichii.exe")) {
+            throw "lichii.exe was not generated"
+          }
+          windeployqt --release --no-translations build/release/bin/lichii.exe
+          Get-ChildItem build/release/bin -Filter *.exe | Select-Object Name,Length
+
+      - name: Upload Windows replacement package
+        uses: actions/upload-artifact@v4
+        with:
+          name: lichii-dusk-v4-amd-experimental-windows
+          path: upstream/build/release/bin/
+          if-no-files-found: error
+          retention-days: 14
