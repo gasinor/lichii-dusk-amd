@@ -26,6 +26,7 @@ jobs:
         run: |
           python - <<'PY'
           from pathlib import Path
+          import textwrap
           root = Path("upstream")
 
           def rep(path, old, new):
@@ -73,7 +74,7 @@ jobs:
                  '                const bool dusk_v25_size = dusk && mode == "v25";')
           rep(p, old, new)
           old = '                    return (std::min)(packed_size, limit);'
-          new = """                    u32 bound = (std::min)(packed_size, limit);
+          new = textwrap.indent(textwrap.dedent("""                    u32 bound = (std::min)(packed_size, limit);
                       if (dusk && runtime.IsAmdVulkan() && mode != "read") {
                           constexpr u32 amd_dusk_cap = static_cast<u32>(128_MiB);
                           if (bound > amd_dusk_cap) {
@@ -85,7 +86,7 @@ jobs:
                               bound = amd_dusk_cap;
                           }
                       }
-                      return bound;""".replace(/^ {22}/gm,"                    ")
+                      return bound;"""), "                    ").rstrip()
           # Scoped to the branch, not the other size-word return in this function.
           s = (root / p).read_text(encoding="utf-8")
           needle = ('                if (compute && !is_written && next_qword_is_size && packed_size > bare &&\n'
